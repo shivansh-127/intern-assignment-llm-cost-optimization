@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
 from dataclasses import dataclass
 
 from shared.billing import CostSession
@@ -54,33 +53,27 @@ class SupportCopilot:
         self.session = session or CostSession()
         self.llm = LlmClient(self.session)
 
+
     def build_messages(self, ticket_id: str) -> list[ChatMessage]:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
-        thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
 
-        system = "\n\n".join(
-            [
-                f"Run id {uuid.uuid4()}",
-                "You are ShopAssist, the Tier-1 customer support copilot.",
-                _FEW_SHOT,
-                "HELP CENTER:",
-                all_articles_blob(),
-                (
-                    "Instructions: Think step by step. Write full reasoning, quote any article "
-                    "you rely on, then output JSON with action, kb_article, customer_reply."
-                ),
-            ]
+        snapshot = json.dumps(order, separators=(",", ":"))
+
+        system = (
+            "You are ShopAssist. "
+            "Return JSON containing action, kb_article, and customer_reply. "
+            "Be concise."
         )
-        user = "\n\n".join(
-            [
-                f"TICKET_ID: {ticket_id}",
-                f"THREAD:\n{thread}",
-                f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ]
+
+        user = (
+            f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT"
         )
-        return [ChatMessage("system", system), ChatMessage("user", user)]
+
+        return [
+            ChatMessage("system", system),
+            ChatMessage("user", user)
+        ]
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
         messages = self.build_messages(ticket_id)

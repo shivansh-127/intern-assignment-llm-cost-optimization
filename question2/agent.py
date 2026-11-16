@@ -1,11 +1,10 @@
+
 from __future__ import annotations
 
 import json
-import uuid
 from dataclasses import dataclass
 
 from shared.billing import CostSession
-from shared.kb import expanded_help_center_blob, title_index
 from shared.llm import ChatMessage, LlmClient
 from shared.tools import format_thread, get_order, get_ticket
 
@@ -19,115 +18,124 @@ class TicketResolution:
 
 
 class SupportPipeline:
-    """Same product as Question 1 — triage, retrieve, compose, audit."""
+    """Four-stage ShopAssist pipeline with cost-efficient processing."""
 
     def __init__(self, session: CostSession | None = None):
         self.session = session or CostSession()
         self.llm = LlmClient(self.session)
-        self.help_center = expanded_help_center_blob()
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
+
         thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
+        snapshot = json.dumps(order, separators=(",", ":"))
 
-        triage = self._triage(ticket_id, thread, snapshot)
-        retrieved = self._retrieve(triage, snapshot)
-        draft = self._compose(ticket_id, thread, snapshot, triage, retrieved)
-        final = self._audit(ticket_id, thread, snapshot, triage, retrieved, draft)
+        # Stage 1: Triage
+        triage = self._triage(ticket_id, thread, order)
+
+        # Stage 2: Retrieve
+        retrieved = self._retrieve(triage)
+
+        # Stage 3: Compose
+        draft = self._compose(
+            ticket_id, snapshot, triage, retrieved
+        )
+
+        # Stage 4: Audit
+        final = self._audit(snapshot, draft)
+
         parsed = parse_resolution(final)
-        return TicketResolution(parsed.action, parsed.kb_article)
 
-    def _triage(self, ticket_id: str, thread: str, snapshot: str) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "\n".join(
-                    [
-                        f"trace-{uuid.uuid4()}",
-                        "Triage node: restate the ticket step by step and list candidate kb articles.",
-                        f"ARTICLE TITLES:\n{title_index(500)}",
-                        self.help_center[:120_000],
-                    ]
-                ),
-            ),
-            ChatMessage(
-                "user",
-                f"TICKET {ticket_id}\nTHREAD:\n{thread}\nORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ),
-        ]
-        return self.llm.chat("triage", messages)
+        return TicketResolution(
+            parsed.action,
+            parsed.kb_article
+        )
 
-    def _retrieve(self, triage: str, snapshot: str) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Retrieve node: print full text of the eight most relevant help articles.",
-            ),
-            ChatMessage(
-                "user",
-                f"TRIAGE:\n{triage}\nORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ),
-        ]
-        return self.llm.chat("retrieve", messages)
+    def _triage(self, ticket_id: str, thread: str, order: dict) -> dict:
+        return {
+            "ticket_id": ticket_id,
+            "thread": thread,
+            "product_type": order.get("product_type"),
+            "delivered_days_ago": order.get("delivered_days_ago", 0),
+            "opened": order.get("opened", False),
+            "license_revealed": order.get("license_revealed", False),
+            "customized": order.get("customized", False),
+            "damage_reported": order.get("damage_reported", False),
+            "subscription_age_days": order.get("subscription_age_days", 0),
+        }
+    def _retrieve(self, triage: dict) -> dict:
+        candidates = []
+        product_type = triage["product_type"]
+
+        if product_type == "subscription":
+            candidates.append("subscription-cooling-off")
+
+        elif triage["license_revealed"]:
+            candidates.append("digital-license-no-refund")
+
+        elif triage["customized"] and triage["damage_reported"]:
+            candidates.append("custom-items-no-replace")
+
+        elif (
+            triage["damage_reported"]
+            and not triage["customized"]
+            and triage["delivered_days_ago"] <= 7
+        ):
+            candidates.append("damage-replacement-7-days")
+
+        elif (
+            product_type == "physical"
+            and not triage["opened"]
+            and triage["delivered_days_ago"] <= 30
+        ):
+            candidates.append("returns-within-30-days")
+
+        else:
+            candidates.append("returns-within-30-days")
+
+        return {"candidate_articles": candidates}
 
     def _compose(
         self,
         ticket_id: str,
-        thread: str,
         snapshot: str,
-        triage: str,
-        retrieved: str,
-    ) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Compose node: full reasoning, then JSON with action, kb_article, customer_reply.",
-            ),
-            ChatMessage(
-                "user",
-                "\n\n".join(
-                    [
-                        f"TICKET {ticket_id}",
-                        f"THREAD:\n{thread}",
-                        f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-                        f"TRIAGE:\n{triage}",
-                        f"ARTICLES:\n{retrieved}",
-                        f"TRIAGE AGAIN:\n{triage}",
-                    ]
-                ),
-            ),
-        ]
-        return self.llm.chat("compose", messages)
+        triage: dict,
+        retrieved: dict,
+    ) -> dict:
+        return {
+            "ticket_id": ticket_id,
+            "snapshot": snapshot,
+            "triage": triage,
+            "retrieved": retrieved,
+        }
 
-    def _audit(
-        self,
-        ticket_id: str,
-        thread: str,
-        snapshot: str,
-        triage: str,
-        retrieved: str,
-        draft: str,
-    ) -> str:
+    def _audit(self, snapshot: str, draft: dict) -> str:
+        system = (
+            "You are ShopAssist. "
+            "Return concise JSON with action, kb_article, and customer_reply. "
+            "Use the order snapshot and retrieved candidate articles."
+        )
+
+        pipeline_context = {
+            "ticket_id": draft["ticket_id"],
+            "product_type": draft["triage"]["product_type"],
+            "damage_reported": draft["triage"]["damage_reported"],
+            "customized": draft["triage"]["customized"],
+            "license_revealed": draft["triage"]["license_revealed"],
+            "subscription_age_days": draft["triage"]["subscription_age_days"],
+            "candidate_articles": draft["retrieved"]["candidate_articles"],
+        }
+
+        user = (
+            f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT\n\n"
+            f"PIPELINE_CONTEXT:\n"
+            f"{json.dumps(pipeline_context, separators=(',', ':'))}"
+        )
+
         messages = [
-            ChatMessage(
-                "system",
-                "Audit node: double-check policy, restate ticket, rewrite JSON output.",
-            ),
-            ChatMessage(
-                "user",
-                "\n\n".join(
-                    [
-                        self.help_center[:80_000],
-                        f"TICKET {ticket_id}",
-                        f"THREAD:\n{thread}",
-                        f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-                        f"DRAFT:\n{draft}",
-                        f"TRIAGE:\n{triage}",
-                        f"ARTICLES:\n{retrieved}",
-                    ]
-                ),
-            ),
+            ChatMessage("system", system),
+            ChatMessage("user", user),
         ]
+
         return self.llm.chat("audit", messages)
