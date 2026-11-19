@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 from shared.billing import CostSession
+from shared.kb import article_ids, load_article
 from shared.llm import ChatMessage, LlmClient
 from shared.tools import format_thread, get_order, get_ticket
 
@@ -18,7 +20,24 @@ class TicketResolution:
 
 
 class SupportPipeline:
-    """Four-stage ShopAssist pipeline with cost-efficient processing."""
+    """Cost-efficient four-stage ShopAssist support pipeline."""
+
+    VALID_ACTIONS = {
+        "REFUND",
+        "REPLACE",
+        "SEND_ARTICLE",
+        "ESCALATE_TIER2",
+    }
+
+    STOPWORDS = {
+        "the", "a", "an", "is", "are", "was", "were",
+        "i", "we", "you", "my", "our", "your", "it",
+        "to", "for", "of", "on", "in", "at", "and",
+        "or", "but", "can", "could", "please", "me",
+        "they", "this", "that", "with", "have", "has",
+        "had", "be", "been", "do", "did", "does",
+        "get", "got", "just", "already", "now", "day",
+    }
 
     def __init__(self, session: CostSession | None = None):
         self.session = session or CostSession()
@@ -27,7 +46,6 @@ class SupportPipeline:
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
-
         thread = format_thread(ticket)
         snapshot = json.dumps(order, separators=(",", ":"))
 
@@ -43,16 +61,14 @@ class SupportPipeline:
         )
 
         # Stage 4: Audit
-        final = self._audit(snapshot, draft)
+        allowed_articles = {
+            item["article_id"] for item in retrieved["articles"]
+        }
+        return self._audit(snapshot, draft, allowed_articles)
 
-        parsed = parse_resolution(final)
-
-        return TicketResolution(
-            parsed.action,
-            parsed.kb_article
-        )
-
-    def _triage(self, ticket_id: str, thread: str, order: dict) -> dict:
+    def _triage(
+        self, ticket_id: str, thread: str, order: dict
+    ) -> dict:
         return {
             "ticket_id": ticket_id,
             "thread": thread,
@@ -64,37 +80,77 @@ class SupportPipeline:
             "damage_reported": order.get("damage_reported", False),
             "subscription_age_days": order.get("subscription_age_days", 0),
         }
+
+    @classmethod
+    def _terms(cls, text: str) -> set[str]:
+        words = re.findall(r"[a-z0-9]+", text.lower())
+        return {
+            word for word in words
+            if len(word) > 2 and word not in cls.STOPWORDS
+        }
+
     def _retrieve(self, triage: dict) -> dict:
-        candidates = []
-        product_type = triage["product_type"]
+        query = (
+            triage["thread"]
+            + " "
+            + json.dumps(triage, separators=(",", ":"))
+        )
+        query_terms = self._terms(query)
 
-        if product_type == "subscription":
-            candidates.append("subscription-cooling-off")
+        ranked = []
 
-        elif triage["license_revealed"]:
-            candidates.append("digital-license-no-refund")
+        for article_id in article_ids():
+            content = load_article(article_id)
+            article_terms = self._terms(
+                article_id.replace("-", " ") + " " + content
+            )
 
-        elif triage["customized"] and triage["damage_reported"]:
-            candidates.append("custom-items-no-replace")
+            overlap = query_terms & article_terms
 
-        elif (
-            triage["damage_reported"]
-            and not triage["customized"]
-            and triage["delivered_days_ago"] <= 7
-        ):
-            candidates.append("damage-replacement-7-days")
+            # Base relevance from actual article content.
+            score = len(overlap)
 
-        elif (
-            product_type == "physical"
-            and not triage["opened"]
-            and triage["delivered_days_ago"] <= 30
-        ):
-            candidates.append("returns-within-30-days")
+            # Policy-specific signals improve ranking where
+            # generic words such as "replacement" are ambiguous.
+            if article_id == "subscription-cooling-off":
+                if triage["product_type"] == "subscription":
+                    score += 8
 
-        else:
-            candidates.append("returns-within-30-days")
+            elif article_id == "digital-license-no-refund":
+                if triage["license_revealed"]:
+                    score += 8
 
-        return {"candidate_articles": candidates}
+            elif article_id == "custom-items-no-replace":
+                if triage["customized"] and triage["damage_reported"]:
+                    score += 10
+
+            elif article_id == "damage-replacement-7-days":
+                if (
+                    triage["damage_reported"]
+                    and not triage["customized"]
+                    and triage["delivered_days_ago"] <= 7
+                ):
+                    score += 10
+
+            elif article_id == "returns-within-30-days":
+                if (
+                    triage["product_type"] == "physical"
+                    and not triage["opened"]
+                    and triage["delivered_days_ago"] <= 30
+                ):
+                    score += 8
+
+            ranked.append({
+                "article_id": article_id,
+                "score": score,
+                "content": content,
+            })
+
+        ranked.sort(
+            key=lambda item: (-item["score"], item["article_id"])
+        )
+
+        return {"articles": ranked[:3]}
 
     def _compose(
         self,
@@ -102,35 +158,40 @@ class SupportPipeline:
         snapshot: str,
         triage: dict,
         retrieved: dict,
-    ) -> dict:
-        return {
-            "ticket_id": ticket_id,
-            "snapshot": snapshot,
-            "triage": triage,
-            "retrieved": retrieved,
-        }
+    ) -> str:
+        articles = [
+            {
+                "article_id": item["article_id"],
+                "content": item["content"],
+            }
+            for item in retrieved["articles"]
+        ]
 
-    def _audit(self, snapshot: str, draft: dict) -> str:
         system = (
-            "You are ShopAssist. "
-            "Return concise JSON with action, kb_article, and customer_reply. "
-            "Use the order snapshot and retrieved candidate articles."
+            "You are ShopAssist, a customer support assistant. "
+            "Use the customer conversation, order snapshot, and "
+            "retrieved help-center policies to determine the correct "
+            "resolution. Follow the most specific applicable policy. "
+            "Return only JSON with action, kb_article, and customer_reply. "
+            "The action must be REFUND, REPLACE, SEND_ARTICLE, "
+            "or ESCALATE_TIER2. Keep the reply concise."
         )
 
-        pipeline_context = {
-            "ticket_id": draft["ticket_id"],
-            "product_type": draft["triage"]["product_type"],
-            "damage_reported": draft["triage"]["damage_reported"],
-            "customized": draft["triage"]["customized"],
-            "license_revealed": draft["triage"]["license_revealed"],
-            "subscription_age_days": draft["triage"]["subscription_age_days"],
-            "candidate_articles": draft["retrieved"]["candidate_articles"],
+        context = {
+            "ticket_id": ticket_id,
+            "customer_thread": triage["thread"],
+            "triage": {
+                key: value
+                for key, value in triage.items()
+                if key not in {"thread", "ticket_id"}
+            },
+            "retrieved_articles": articles,
         }
 
         user = (
             f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT\n\n"
-            f"PIPELINE_CONTEXT:\n"
-            f"{json.dumps(pipeline_context, separators=(',', ':'))}"
+            f"CASE_CONTEXT:\n"
+            f"{json.dumps(context, separators=(',', ':'))}"
         )
 
         messages = [
@@ -138,4 +199,68 @@ class SupportPipeline:
             ChatMessage("user", user),
         ]
 
-        return self.llm.chat("audit", messages)
+        return self.llm.chat("compose", messages)
+
+    def _is_valid(
+        self,
+        result: TicketResolution,
+        allowed_articles: set[str],
+    ) -> bool:
+        return (
+            result.action in self.VALID_ACTIONS
+            and result.kb_article in article_ids()
+            and result.kb_article in allowed_articles
+        )
+
+
+    def _audit(
+        self,
+        snapshot: str,
+        draft: str,
+        allowed_articles: set[str],
+    ) -> TicketResolution:
+
+    # Validate the first response locally.
+        try:
+            parsed = parse_resolution(draft)
+
+            if self._is_valid(parsed, allowed_articles):
+                return TicketResolution(
+                    parsed.action,
+                    parsed.kb_article,
+                )
+
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            pass
+
+        # Retry only if the response is malformed or invalid.
+        repair_system = (
+            "Return a valid JSON support resolution. "
+            "Use one of these actions: REFUND, REPLACE, "
+            "SEND_ARTICLE, ESCALATE_TIER2. "
+            f"The kb_article must be one of: "
+            f"{', '.join(sorted(allowed_articles))}. "
+            "Return action, kb_article, and customer_reply only."
+        )
+
+        repair_user = (
+            f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT\n\n"
+            f"PREVIOUS_RESPONSE:\n{draft}"
+        )
+
+        repaired = self.llm.chat(
+            "audit_retry",
+            [
+                ChatMessage("system", repair_system),
+                ChatMessage("user", repair_user),
+            ],
+        )
+
+        result = parse_resolution(repaired)
+
+        if not self._is_valid(result, allowed_articles):
+            raise ValueError(
+                f"Invalid resolution after retry: {result}"
+            )
+
+        return TicketResolution(result.action, result.kb_article)

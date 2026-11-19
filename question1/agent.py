@@ -41,38 +41,39 @@ Example ticket resolutions (format to copy):
 """
 
 
-class SupportCopilot:
-    """
-    ShopAssist Tier-1 copilot (baseline).
 
-    Given a support ticket + order snapshot, choose an action, cite the help-center
-    article, and draft the customer reply.
-    """
+class SupportCopilot:
+    """Cost-efficient, context-aware ShopAssist support copilot."""
 
     def __init__(self, session: CostSession | None = None):
         self.session = session or CostSession()
         self.llm = LlmClient(self.session)
-
 
     def build_messages(self, ticket_id: str) -> list[ChatMessage]:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
 
         snapshot = json.dumps(order, separators=(",", ":"))
+        thread = format_thread(ticket)
 
         system = (
-            "You are ShopAssist. "
-            "Return JSON containing action, kb_article, and customer_reply. "
-            "Be concise."
+            "You are ShopAssist, a customer support assistant. "
+            "Use the customer conversation, order details, and "
+            "help-center policies to select the correct action. "
+            "Return only JSON with action, kb_article, and "
+            "customer_reply. Keep the reply concise.\n\n"
+            "HELP CENTER:\n"
+            + all_articles_blob()
         )
 
         user = (
+            f"CUSTOMER_THREAD:\n{thread}\n\n"
             f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT"
         )
 
         return [
             ChatMessage("system", system),
-            ChatMessage("user", user)
+            ChatMessage("user", user),
         ]
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
